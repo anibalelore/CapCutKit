@@ -2,8 +2,9 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "pyobjc-framework-ApplicationServices",
-#   "pyobjc-framework-Quartz",
+#   "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
+#   "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+#   "psutil; sys_platform == 'win32'",
 # ]
 # ///
 # CapCut bridge: drive the CapCut Mac app live + replay a job's EDL into a new
@@ -65,12 +66,22 @@ Usage — live lane (open editor, no restart):
   shot [out.png]                           # window grab for QA
   dump [needle] · click <name> · clickxy <x> <y> · key <combo>"""
 import json
+import os
+
+# Prefer the locally installed FFmpeg tools when present.
 import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
+
+_TOOL_BIN = Path(__file__).resolve().parent / "tools" / "bin"
+if _TOOL_BIN.is_dir():
+    os.environ["PATH"] = str(_TOOL_BIN) + os.pathsep + os.environ.get("PATH", "")
+
+IS_WINDOWS = sys.platform == "win32"
+DRAFT_FILE = "draft_content.json" if IS_WINDOWS else "draft_info.json"
 
 DRAFT_ROOT = Path.home() / "Movies/CapCut/User Data/Projects/com.lveditor.draft"
 APP = "CapCut"
@@ -103,294 +114,301 @@ def launch_app():
 
 # ---------------------------------------------------------------- AX driver
 
-from ApplicationServices import (  # noqa: E402
-    AXUIElementCreateApplication,
-    AXUIElementCopyAttributeValue,
-    AXValueGetValue,
-    kAXValueCGPointType,
-    kAXValueCGSizeType,
-)
-from Quartz import (  # noqa: E402
-    CGEventCreateKeyboardEvent,
-    CGEventCreateMouseEvent,
-    CGEventPost,
-    CGEventSetFlags,
-    CGEventSetIntegerValueField,
-    kCGEventFlagMaskCommand,
-    kCGEventFlagMaskShift,
-    kCGEventLeftMouseDown,
-    kCGEventLeftMouseUp,
-    kCGEventMouseMoved,
-    kCGHIDEventTap,
-    kCGMouseButtonLeft,
-    kCGMouseEventClickState,
-)
+if not IS_WINDOWS:
+    from ApplicationServices import (  # noqa: E402
+        AXUIElementCreateApplication,
+        AXUIElementCopyAttributeValue,
+        AXValueGetValue,
+        kAXValueCGPointType,
+        kAXValueCGSizeType,
+    )
+    from Quartz import (  # noqa: E402
+        CGEventCreateKeyboardEvent,
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        CGEventSetFlags,
+        CGEventSetIntegerValueField,
+        kCGEventFlagMaskCommand,
+        kCGEventFlagMaskShift,
+        kCGEventLeftMouseDown,
+        kCGEventLeftMouseUp,
+        kCGEventMouseMoved,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
+        kCGMouseEventClickState,
+    )
 
-KEYCODES = {"space": 49, "return": 36, "escape": 53, "delete": 51, "tab": 48,
-            "left": 123, "right": 124, "down": 125, "up": 126,
-            "home": 115, "end": 119,
-            "a": 0, "b": 11, "c": 8, "s": 1, "v": 9, "z": 6}
-
-
-def ax_app():
-    pid = app_pid()
-    if pid is None:
-        sys.exit("CapCut is not running (use: launch)")
-    return AXUIElementCreateApplication(pid)
+    KEYCODES = {"space": 49, "return": 36, "escape": 53, "delete": 51, "tab": 48,
+                "left": 123, "right": 124, "down": 125, "up": 126,
+                "home": 115, "end": 119,
+                "a": 0, "b": 11, "c": 8, "s": 1, "v": 9, "z": 6}
 
 
-def attr(el, name):
-    err, val = AXUIElementCopyAttributeValue(el, name, None)
-    return val if err == 0 else None
+    def ax_app():
+        pid = app_pid()
+        if pid is None:
+            sys.exit("CapCut is not running (use: launch)")
+        return AXUIElementCreateApplication(pid)
 
 
-def geometry(el):
-    ok, p = AXValueGetValue(attr(el, "AXPosition"), kAXValueCGPointType, None)
-    ok2, s = AXValueGetValue(attr(el, "AXSize"), kAXValueCGSizeType, None)
-    return (p.x, p.y, s.width, s.height) if ok and ok2 else None
+    def attr(el, name):
+        err, val = AXUIElementCopyAttributeValue(el, name, None)
+        return val if err == 0 else None
 
 
-def walk(el, visit, depth=0):
-    if depth > 18:
-        return
-    visit(el, depth)
-    for k in attr(el, "AXChildren") or []:
-        walk(k, visit, depth + 1)
+    def geometry(el):
+        ok, p = AXValueGetValue(attr(el, "AXPosition"), kAXValueCGPointType, None)
+        ok2, s = AXValueGetValue(attr(el, "AXSize"), kAXValueCGSizeType, None)
+        return (p.x, p.y, s.width, s.height) if ok and ok2 else None
 
 
-def elements(needle=None):
-    """All (element, name, geometry) in all CapCut windows, name = title or description."""
-    out = []
-
-    def visit(el, depth):
-        name = attr(el, "AXTitle") or attr(el, "AXDescription") or ""
-        if needle is None or needle.lower() in name.lower():
-            out.append((el, name, geometry(el)))
-
-    for w in attr(ax_app(), "AXWindows") or []:
-        walk(w, visit)
-    return out
+    def walk(el, visit, depth=0):
+        if depth > 18:
+            return
+        visit(el, depth)
+        for k in attr(el, "AXChildren") or []:
+            walk(k, visit, depth + 1)
 
 
-def find_one(needle, timeout=0):
-    t0 = time.time()
-    while True:
-        hits = [h for h in elements(needle) if h[2]]
-        if hits:
-            return hits[0]
-        if time.time() - t0 >= timeout:
-            return None
-        time.sleep(0.5)
+    def elements(needle=None):
+        """All (element, name, geometry) in all CapCut windows, name = title or description."""
+        out = []
+
+        def visit(el, depth):
+            name = attr(el, "AXTitle") or attr(el, "AXDescription") or ""
+            if needle is None or needle.lower() in name.lower():
+                out.append((el, name, geometry(el)))
+
+        for w in attr(ax_app(), "AXWindows") or []:
+            walk(w, visit)
+        return out
 
 
-_fronted = False
+    def find_one(needle, timeout=0):
+        t0 = time.time()
+        while True:
+            hits = [h for h in elements(needle) if h[2]]
+            if hits:
+                return hits[0]
+            if time.time() - t0 >= timeout:
+                return None
+            time.sleep(0.5)
 
 
-def ensure_front():
-    """Activate CapCut before any synthesized input. Keystrokes go to whatever app
-    is frontmost, so they need this outright. Clicks need it too, for a subtler
-    reason that caused days of phantom flakiness: when the app is not frontmost,
-    macOS spends the FIRST click activating the window and the app never sees it.
-    In `calibrate` that meant probe A silently no-op'd, `ta` read a stale playhead,
-    and the seconds<->pixels fit came out garbage — seek landing 40s off target,
-    but only when some earlier action had not already fronted the app."""
-    global _fronted
-    if not _fronted:
-        subprocess.run(["osascript", "-e", f'tell application "{APP}" to activate'],
-                       check=False)
-        time.sleep(0.4)
-        _fronted = True
+    _fronted = False
 
 
-def click_at(x, y, clicks=1):
-    ensure_front()
-    e = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (x, y), kCGMouseButtonLeft)
-    CGEventPost(kCGHIDEventTap, e)
-    time.sleep(0.05)
-    for n in range(1, clicks + 1):
-        for kind in (kCGEventLeftMouseDown, kCGEventLeftMouseUp):
-            e = CGEventCreateMouseEvent(None, kind, (x, y), kCGMouseButtonLeft)
-            CGEventSetIntegerValueField(e, kCGMouseEventClickState, n)
-            CGEventPost(kCGHIDEventTap, e)
-            time.sleep(0.05)
+    def ensure_front():
+        """Activate CapCut before any synthesized input. Keystrokes go to whatever app
+        is frontmost, so they need this outright. Clicks need it too, for a subtler
+        reason that caused days of phantom flakiness: when the app is not frontmost,
+        macOS spends the FIRST click activating the window and the app never sees it.
+        In `calibrate` that meant probe A silently no-op'd, `ta` read a stale playhead,
+        and the seconds<->pixels fit came out garbage — seek landing 40s off target,
+        but only when some earlier action had not already fronted the app."""
+        global _fronted
+        if not _fronted:
+            subprocess.run(["osascript", "-e", f'tell application "{APP}" to activate'],
+                           check=False)
+            time.sleep(0.4)
+            _fronted = True
 
 
-def click_element(needle, clicks=1, timeout=5):
-    hit = find_one(needle, timeout)
-    if hit is None:
-        sys.exit(f"element not found: {needle}")
-    el, name, (x, y, w, h) = hit
-    click_at(x + w / 2, y + h / 2, clicks)
-    return name
-
-
-def send_key(combo):
-    ensure_front()
-    parts = combo.lower().split("+")
-    key = parts[-1]
-    if key not in KEYCODES:
-        sys.exit(f"unknown key: {key} (known: {', '.join(sorted(KEYCODES))})")
-    flags = 0
-    if "cmd" in parts:
-        flags |= kCGEventFlagMaskCommand
-    if "shift" in parts:
-        flags |= kCGEventFlagMaskShift
-    for down in (True, False):
-        e = CGEventCreateKeyboardEvent(None, KEYCODES[key], down)
-        if flags:
-            CGEventSetFlags(e, flags)
+    def click_at(x, y, clicks=1):
+        ensure_front()
+        e = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (x, y), kCGMouseButtonLeft)
         CGEventPost(kCGHIDEventTap, e)
-        time.sleep(0.03)
+        time.sleep(0.05)
+        for n in range(1, clicks + 1):
+            for kind in (kCGEventLeftMouseDown, kCGEventLeftMouseUp):
+                e = CGEventCreateMouseEvent(None, kind, (x, y), kCGMouseButtonLeft)
+                CGEventSetIntegerValueField(e, kCGMouseEventClickState, n)
+                CGEventPost(kCGHIDEventTap, e)
+                time.sleep(0.05)
 
 
-def read_playhead():
-    cur = find_one("currentProgress")
-    tot = find_one("totalProgress")
-    d = lambda h: (attr(h[0], "AXDescription") or "").split("|")[-1] if h else "?"
-    return d(cur), d(tot)
+    def click_element(needle, clicks=1, timeout=5):
+        hit = find_one(needle, timeout)
+        if hit is None:
+            sys.exit(f"element not found: {needle}")
+        el, name, (x, y, w, h) = hit
+        click_at(x + w / 2, y + h / 2, clicks)
+        return name
 
 
-# ---------------------------------------------------------------- live editing
-
-RULER_DY = 33  # ruler row sits this far below the timeline toolbar's top edge
-
-
-def parse_tc(tc, fps):
-    h, m, s, f = (int(x) for x in tc.split(":"))
-    return h * 3600 + m * 60 + s + f / fps
-
-
-def draft_fps(name=None):
-    if name:
-        try:
-            return json.loads((DRAFT_ROOT / name / "draft_info.json").read_text())["fps"]
-        except (OSError, KeyError, json.JSONDecodeError):
-            pass
-    return 30.0
-
-
-def playhead_seconds(fps):
-    cur, _ = read_playhead()
-    return parse_tc(cur, fps) if cur != "?" else None
-
-
-def timeline_clips():
-    """Main + overlay clips, left-to-right, as (name, x, y, w, h)."""
-    return sorted(((n, *g) for _, n, g in elements("MTLSVideoP") if g),
-                  key=lambda c: (c[2], c[1]))
-
-
-def ruler_y():
-    hit = find_one("cutoff") or find_one("undo")
-    if hit is None:
-        sys.exit("timeline toolbar not found (is a draft open?)")
-    return hit[2][1] + RULER_DY
-
-
-def click_ruler(x, y=None):
-    click_at(x, y if y is not None else ruler_y())
-    time.sleep(0.35)
-
-
-def visible_ruler_span():
-    """Clickable x range of the ruler. Clip geometry alone is NOT usable: zoomed
-    in, a long clip's AX box runs thousands of px off-screen in both directions
-    (measured x=-2389 w=12646), so probe points derived from it land nowhere and
-    the fit comes out garbage. Clamp to the timeline viewport, past the track
-    headers on the left."""
-    root = find_one("MainTimeLineRoot")
-    if root is None:
-        sys.exit("timeline not found (is a draft open?)")
-    rx, _, rw, _ = root[2]
-    left, right = rx + 180, rx + rw - 20
-    clips = timeline_clips()
-    if clips:                       # never probe past the end of the content
-        right = min(right, max(c[1] + c[3] for c in clips))
-        left = max(left, min(c[1] for c in clips))
-    if right - left < 80:
-        left, right = rx + 180, rx + rw - 20
-    return left, right
-
-
-def calibrate(fps):
-    """Fit seconds<->pixels from the app's OWN playhead readout: click two ruler
-    points and read where it landed. Self-calibrating, so it survives any zoom
-    or scroll state instead of assuming the timeline origin."""
-    left, right = visible_ruler_span()
-    span = right - left
-    xa, xb = left + span * 0.30, left + span * 0.75  # clear of the dead strip
-    click_ruler(xa)
-    ta = playhead_seconds(fps)
-    click_ruler(xb)
-    tb = playhead_seconds(fps)
-    if ta is None or tb is None or abs(tb - ta) < 1e-6:
-        sys.exit("calibration failed (playhead did not move) — check for a "
-                 "yellow onboarding tooltip over the ruler: it swallows clicks "
-                 "and is invisible to the AX tree. Run `shot` and look.")
-    sec_per_px = (tb - ta) / (xb - xa)
-    return lambda t: xa + (t - ta) / sec_per_px, sec_per_px
-
-
-def seek(seconds, fps=30.0, tolerance_frames=0):
-    """Park the playhead on an exact frame: click the mapped ruler x, then close
-    the rest with arrow-key frame steps, re-reading between rounds.
-
-    The arrow convergence is not a garnish, it is what makes this reliable. The
-    ruler has a dead strip roughly 90px wide at its left edge that silently eats
-    clicks (measured at two zoom levels, boundary fixed in screen space), so any
-    target in the first few seconds cannot be clicked to directly — seek lands
-    wherever it can and steps in. Steps must also be PACED: sent back to back
-    CapCut drops most of them (195 sent, 28 applied)."""
-    x_of, _ = calibrate(fps)
-    click_ruler(x_of(seconds))
-    for _ in range(8):
-        now = playhead_seconds(fps)
-        if now is None:
-            break
-        err = round((seconds - now) * fps)
-        if abs(err) <= tolerance_frames:
-            return now
-        key = "right" if err > 0 else "left"
-        for _ in range(min(abs(err), 400)):
-            send_key(key)
+    def send_key(combo):
+        ensure_front()
+        parts = combo.lower().split("+")
+        key = parts[-1]
+        if key not in KEYCODES:
+            sys.exit(f"unknown key: {key} (known: {', '.join(sorted(KEYCODES))})")
+        flags = 0
+        if "cmd" in parts:
+            flags |= kCGEventFlagMaskCommand
+        if "shift" in parts:
+            flags |= kCGEventFlagMaskShift
+        for down in (True, False):
+            e = CGEventCreateKeyboardEvent(None, KEYCODES[key], down)
+            if flags:
+                CGEventSetFlags(e, flags)
+            CGEventPost(kCGHIDEventTap, e)
             time.sleep(0.03)
-        time.sleep(0.3)
-    return playhead_seconds(fps)
 
 
-def select_clip(index):
-    clips = [c for c in timeline_clips()]
-    if index >= len(clips):
-        sys.exit(f"clip index {index} out of range (timeline has {len(clips)})")
-    _, x, y, w, h = clips[index]
-    click_at(x + w / 2, y + h / 2)
-    time.sleep(0.5)
-    return clips[index][0]
+    def read_playhead():
+        cur = find_one("currentProgress")
+        tot = find_one("totalProgress")
+        d = lambda h: (attr(h[0], "AXDescription") or "").split("|")[-1] if h else "?"
+        return d(cur), d(tot)
 
 
-def window_id():
-    from Quartz import (CGWindowListCopyWindowInfo, kCGNullWindowID,
-                        kCGWindowListOptionOnScreenOnly)
-    best = None
-    for w in CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID):
-        if w.get("kCGWindowOwnerName") != APP:
-            continue
-        b = w["kCGWindowBounds"]
-        area = b["Width"] * b["Height"]
-        if best is None or area > best[1]:
-            best = (w["kCGWindowNumber"], area)
-    return best[0] if best else None
+    # ---------------------------------------------------------------- live editing
+
+    RULER_DY = 33  # ruler row sits this far below the timeline toolbar's top edge
 
 
-def grab(out_path):
-    """Window screenshot — the QA loop for checking a graphic actually landed."""
-    wid = window_id()
-    if wid is None:
-        sys.exit("no CapCut window on screen")
-    out = Path(out_path).expanduser().resolve()
-    subprocess.run(["screencapture", "-x", "-o", "-l", str(wid), str(out)], check=True)
-    return out
+    def parse_tc(tc, fps):
+        h, m, s, f = (int(x) for x in tc.split(":"))
+        return h * 3600 + m * 60 + s + f / fps
 
+
+    def draft_fps(name=None):
+        if name:
+            try:
+                return json.loads((DRAFT_ROOT / name / DRAFT_FILE).read_text(encoding="utf-8-sig"))["fps"]
+            except (OSError, KeyError, json.JSONDecodeError):
+                pass
+        return 30.0
+
+
+    def playhead_seconds(fps):
+        cur, _ = read_playhead()
+        return parse_tc(cur, fps) if cur != "?" else None
+
+
+    def timeline_clips():
+        """Main + overlay clips, left-to-right, as (name, x, y, w, h)."""
+        return sorted(((n, *g) for _, n, g in elements("MTLSVideoP") if g),
+                      key=lambda c: (c[2], c[1]))
+
+
+    def ruler_y():
+        hit = find_one("cutoff") or find_one("undo")
+        if hit is None:
+            sys.exit("timeline toolbar not found (is a draft open?)")
+        return hit[2][1] + RULER_DY
+
+
+    def click_ruler(x, y=None):
+        click_at(x, y if y is not None else ruler_y())
+        time.sleep(0.35)
+
+
+    def visible_ruler_span():
+        """Clickable x range of the ruler. Clip geometry alone is NOT usable: zoomed
+        in, a long clip's AX box runs thousands of px off-screen in both directions
+        (measured x=-2389 w=12646), so probe points derived from it land nowhere and
+        the fit comes out garbage. Clamp to the timeline viewport, past the track
+        headers on the left."""
+        root = find_one("MainTimeLineRoot")
+        if root is None:
+            sys.exit("timeline not found (is a draft open?)")
+        rx, _, rw, _ = root[2]
+        left, right = rx + 180, rx + rw - 20
+        clips = timeline_clips()
+        if clips:                       # never probe past the end of the content
+            right = min(right, max(c[1] + c[3] for c in clips))
+            left = max(left, min(c[1] for c in clips))
+        if right - left < 80:
+            left, right = rx + 180, rx + rw - 20
+        return left, right
+
+
+    def calibrate(fps):
+        """Fit seconds<->pixels from the app's OWN playhead readout: click two ruler
+        points and read where it landed. Self-calibrating, so it survives any zoom
+        or scroll state instead of assuming the timeline origin."""
+        left, right = visible_ruler_span()
+        span = right - left
+        xa, xb = left + span * 0.30, left + span * 0.75  # clear of the dead strip
+        click_ruler(xa)
+        ta = playhead_seconds(fps)
+        click_ruler(xb)
+        tb = playhead_seconds(fps)
+        if ta is None or tb is None or abs(tb - ta) < 1e-6:
+            sys.exit("calibration failed (playhead did not move) — check for a "
+                     "yellow onboarding tooltip over the ruler: it swallows clicks "
+                     "and is invisible to the AX tree. Run `shot` and look.")
+        sec_per_px = (tb - ta) / (xb - xa)
+        return lambda t: xa + (t - ta) / sec_per_px, sec_per_px
+
+
+    def seek(seconds, fps=30.0, tolerance_frames=0):
+        """Park the playhead on an exact frame: click the mapped ruler x, then close
+        the rest with arrow-key frame steps, re-reading between rounds.
+
+        The arrow convergence is not a garnish, it is what makes this reliable. The
+        ruler has a dead strip roughly 90px wide at its left edge that silently eats
+        clicks (measured at two zoom levels, boundary fixed in screen space), so any
+        target in the first few seconds cannot be clicked to directly — seek lands
+        wherever it can and steps in. Steps must also be PACED: sent back to back
+        CapCut drops most of them (195 sent, 28 applied)."""
+        x_of, _ = calibrate(fps)
+        click_ruler(x_of(seconds))
+        for _ in range(8):
+            now = playhead_seconds(fps)
+            if now is None:
+                break
+            err = round((seconds - now) * fps)
+            if abs(err) <= tolerance_frames:
+                return now
+            key = "right" if err > 0 else "left"
+            for _ in range(min(abs(err), 400)):
+                send_key(key)
+                time.sleep(0.03)
+            time.sleep(0.3)
+        return playhead_seconds(fps)
+
+
+    def select_clip(index):
+        clips = [c for c in timeline_clips()]
+        if index >= len(clips):
+            sys.exit(f"clip index {index} out of range (timeline has {len(clips)})")
+        _, x, y, w, h = clips[index]
+        click_at(x + w / 2, y + h / 2)
+        time.sleep(0.5)
+        return clips[index][0]
+
+
+    def window_id():
+        from Quartz import (CGWindowListCopyWindowInfo, kCGNullWindowID,
+                            kCGWindowListOptionOnScreenOnly)
+        best = None
+        for w in CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID):
+            if w.get("kCGWindowOwnerName") != APP:
+                continue
+            b = w["kCGWindowBounds"]
+            area = b["Width"] * b["Height"]
+            if best is None or area > best[1]:
+                best = (w["kCGWindowNumber"], area)
+        return best[0] if best else None
+
+
+    def grab(out_path):
+        """Window screenshot — the QA loop for checking a graphic actually landed."""
+        wid = window_id()
+        if wid is None:
+            sys.exit("no CapCut window on screen")
+        out = Path(out_path).expanduser().resolve()
+        subprocess.run(["screencapture", "-x", "-o", "-l", str(wid), str(out)], check=True)
+        return out
+
+
+else:
+    from windows_backend import (DRAFT_ROOT, app_pid, quit_app, launch_app,
+        ax_app, attr, geometry, walk, elements, find_one, ensure_front,
+        click_at, click_element, send_key, read_playhead, timeline_clips,
+        seek, select_clip, grab)
 
 # ---------------------------------------------------------------- draft writing
 
@@ -410,12 +428,12 @@ def uid():
 
 def platform_block():
     # Lift device ids from an existing local draft so the new one reads as native.
-    for p in sorted(DRAFT_ROOT.glob("*/draft_info.json")):
+    for p in sorted(DRAFT_ROOT.glob("*/" + DRAFT_FILE)):
         try:
-            return json.loads(p.read_text())["platform"]
+            return json.loads(p.read_text(encoding="utf-8-sig"))["platform"]
         except (KeyError, json.JSONDecodeError):
             continue
-    return {"os": "mac", "os_version": "", "app_id": 359289, "app_version": "8.9.0",
+    return {"os": "windows" if IS_WINDOWS else "mac", "os_version": "", "app_id": 359289, "app_version": "8.9.0",
             "app_source": "cc", "device_id": "", "hard_disk_id": "", "mac_address": ""}
 
 
@@ -575,7 +593,7 @@ def build_draft(name, raw_path, cuts, canvas_w, canvas_h):
 
     return {
         "id": uid(), "version": 360000, "new_version": "175.0.0", "name": "",
-        "duration": cursor, "create_time": 0, "update_time": 0, "fps": 30.0,
+        "duration": cursor, "create_time": 0, "update_time": 0, "fps": float(cuts.get("fps", 30.0)),
         "is_drop_frame_timecode": False, "color_space": 0,
         "config": {"video_mute": False, "record_audio_last_index": 1,
                    "extract_audio_last_index": 1, "original_sound_last_index": 1,
@@ -670,7 +688,7 @@ def registry_entry(name, folder, draft_id, total_us, now_us):
         "draft_is_ai_shorts": False, "draft_is_cloud_temp_draft": False,
         "draft_is_invisible": False, "draft_is_pippit_draft": False,
         "draft_is_web_article_video": False,
-        "draft_json_file": str(folder / "draft_info.json"), "draft_name": name,
+        "draft_json_file": str(folder / DRAFT_FILE), "draft_name": name,
         "draft_new_version": "", "draft_root_path": str(DRAFT_ROOT),
         "draft_timeline_materials_size": 0, "draft_type": "",
         "draft_web_article_video_enter_from": "", "pippit_avatar_url": "",
@@ -690,20 +708,32 @@ def cmd_replay(job, draft_name=None):
     cuts_path = jobdir / "transcript" / "cuts.json"
     if not cuts_path.exists():
         sys.exit(f"no EDL at {cuts_path}, run rough-cut (RENDER=0) first")
-    cuts = json.loads(cuts_path.read_text())
+    cuts = json.loads(cuts_path.read_text(encoding="utf-8-sig"))
     raw = jobdir / "raw" / cuts["segments"][0]["clip"]
     if not raw.exists():
         sys.exit(f"raw footage missing: {raw}")
-    name = draft_name or job
-    folder = DRAFT_ROOT / name
+    name = draft_name or Path(job).name
+    if Path(name).name != name or name in {".", ".."}:
+        sys.exit("draft name must be a single folder name")
+    folder = (DRAFT_ROOT / name).resolve()
+    if folder.parent != DRAFT_ROOT.resolve():
+        sys.exit("draft must be directly inside the configured draft root")
     if folder.exists():
         sys.exit(f"draft folder already exists: {folder} (pick another --name)")
 
     was_running = app_pid() is not None
+    if IS_WINDOWS and (not shutil.which("ffmpeg") or not shutil.which("ffprobe")):
+        sys.exit("FFmpeg and FFprobe are required; install them before replay")
     if was_running:
         print("quitting CapCut (registry is rewritten on quit)...")
         quit_app()
 
+    if IS_WINDOWS:
+        from windows_backend import backup
+        registry = DRAFT_ROOT / "root_meta_info.json"
+        if not registry.exists():
+            sys.exit("Open CapCut once to initialize its project registry")
+        shutil.copy2(registry, registry.with_name(f"root_meta_info.bridge-{time.time_ns()}.json"))
     folder.mkdir(parents=True)
     (folder / "Resources").mkdir()
     # CapCut is sandboxed with only assets.movies.read-write: it cannot read repo
@@ -719,12 +749,12 @@ def cmd_replay(job, draft_name=None):
     draft, raw_dur_us, w, h = build_draft(name, local_raw, cuts, 1920, 1080)
     now_us = time.time_ns() // 1000
     draft_id = uid()
-    (folder / "draft_info.json").write_text(
-        json.dumps(draft, ensure_ascii=False, separators=(",", ":")))
+    (folder / DRAFT_FILE).write_text(
+        json.dumps(draft, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     (folder / "draft_meta_info.json").write_text(json.dumps(
         meta_entry(name, folder, draft_id, local_raw, raw_dur_us, w, h,
                    draft["duration"], now_us),
-        ensure_ascii=False, separators=(",", ":")))
+        ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     subprocess.run(  # home-screen tile cover, first kept frame; cosmetic only
         ["ffmpeg", "-v", "error", "-ss", str(cuts["segments"][0]["start"]),
@@ -732,11 +762,11 @@ def cmd_replay(job, draft_name=None):
          str(folder / "draft_cover.jpg")], check=False)
 
     root_path = DRAFT_ROOT / "root_meta_info.json"
-    root = json.loads(root_path.read_text())
+    root = json.loads(root_path.read_text(encoding="utf-8-sig"))
     root["all_draft_store"].insert(
         0, registry_entry(name, folder, draft_id, draft["duration"], now_us))
     root["draft_ids"] = root.get("draft_ids", 0) + 1
-    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")))
+    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     n = len(cuts["segments"])
     print(f"draft '{name}': {n} segments, {draft['duration'] / 1e6:.2f}s, {folder}")
@@ -754,13 +784,20 @@ def edit_draft(name, mutate, reopen=True):
     mutate(draft, folder), then wipes the Timelines/ native cache — CapCut only
     imports draft_info.json when that cache is absent, otherwise it silently
     keeps its own state and the edit vanishes."""
-    folder = DRAFT_ROOT / name
+    folder = (DRAFT_ROOT / name).resolve()
+    if folder.parent != DRAFT_ROOT.resolve():
+        sys.exit("draft must be directly inside the configured draft root")
     if not folder.exists():
         sys.exit(f"no such draft: {name}")
     was_running = app_pid() is not None
     quit_app()
 
-    d = json.loads((folder / "draft_info.json").read_text())
+    if IS_WINDOWS:
+        from windows_backend import backup, validate_plaintext
+        d = validate_plaintext(folder / DRAFT_FILE)
+        print("backup:", backup(folder))
+    else:
+        d = json.loads((folder / DRAFT_FILE).read_text(encoding="utf-8-sig"))
     mutate(d, folder)
     # CapCut's own save normalizes text segments to source_timerange: null. That
     # is fine while IT owns the timeline state, but we wipe Timelines/ below to
@@ -773,14 +810,14 @@ def edit_draft(name, mutate, reopen=True):
                                          "duration": s["target_timerange"]["duration"]}
     d["duration"] = max((s["target_timerange"]["start"] + s["target_timerange"]["duration"]
                          for t in d["tracks"] for s in t["segments"]), default=0)
-    (folder / "draft_info.json").write_text(
-        json.dumps(d, ensure_ascii=False, separators=(",", ":")))
-    (folder / "draft_info.json.bak").unlink(missing_ok=True)
+    (folder / DRAFT_FILE).write_text(
+        json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    (folder / (DRAFT_FILE + ".bak")).unlink(missing_ok=True)
     shutil.rmtree(folder / "Timelines", ignore_errors=True)
 
     if was_running:
         launch_app()
-        if reopen:
+        if reopen and not IS_WINDOWS:
             time.sleep(8)
             cmd_open(name)
     return d
@@ -860,7 +897,7 @@ def add_text(name, text, at, duration=3.0, level=1, force=False,
     def mutate(d, folder):
         if not force and already_at(d, round(at * 1e6), text=text):
             sys.exit(f"{text!r} is already at {at}s — pass --force to add a second copy")
-        tm = json.loads(tm_path.read_text())
+        tm = json.loads(tm_path.read_text(encoding="utf-8-sig"))
         content = json.loads(tm["content"])
         content["text"] = text
         for style in content.get("styles", []):
@@ -869,11 +906,11 @@ def add_text(name, text, at, duration=3.0, level=1, force=False,
         tm["content"] = json.dumps(content, ensure_ascii=False)
         d["materials"]["texts"].append(tm)
 
-        anim = json.loads(anim_path.read_text())
+        anim = json.loads(anim_path.read_text(encoding="utf-8-sig"))
         anim["id"] = uid()
         d["materials"]["material_animations"].append(anim)
 
-        seg = json.loads(seg_path.read_text())
+        seg = json.loads(seg_path.read_text(encoding="utf-8-sig"))
         seg["id"] = uid()
         seg["material_id"] = tm["id"]
         seg["extra_material_refs"] = [anim["id"]]
@@ -1047,7 +1084,7 @@ def cmd_graphics(name, job):
     plan_path = repo / "projects" / job / "graphics-plan.json"
     if not plan_path.exists():
         sys.exit(f"no graphics plan at {plan_path}")
-    plan = json.loads(plan_path.read_text())
+    plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
     beats = plan.get("graphics") or plan.get("beats") or []
     assets = repo / "projects" / job / "assets"
     queued = []
@@ -1176,13 +1213,15 @@ def cmd_state(name=None):
     """Timeline snapshot. Exact segment times come from draft_info.json (the
     saved truth); the live AX clip count is compared against it, because live
     edits only reach disk on save/quit — a mismatch means unsaved changes."""
-    cur, tot = read_playhead()
-    live = timeline_clips()
-    out = {"playhead": cur, "duration": tot, "live_clip_count": len(live)}
+    cur, tot = (None, None) if IS_WINDOWS else read_playhead()
+    live = [] if IS_WINDOWS else timeline_clips()
+    out = {"playhead": cur, "duration": tot, "live_clip_count": None if IS_WINDOWS else len(live)}
+    if IS_WINDOWS:
+        out["source"] = "saved draft; live state is unavailable"
 
-    path = DRAFT_ROOT / name / "draft_info.json" if name else None
+    path = DRAFT_ROOT / name / DRAFT_FILE if name else None
     if path and path.exists():
-        d = json.loads(path.read_text())
+        d = json.loads(path.read_text(encoding="utf-8-sig"))
         tracks = []
         for t in d["tracks"]:
             segs = []
@@ -1203,7 +1242,7 @@ def cmd_state(name=None):
                            "segments": segs})
         out["saved"] = {"duration": round(d["duration"] / 1e6, 3), "tracks": tracks}
         saved_video = sum(len(t["segments"]) for t in d["tracks"] if t["type"] == "video")
-        if saved_video != len(live):
+        if not IS_WINDOWS and saved_video != len(live):
             out["unsaved_edits"] = f"{len(live)} clips live vs {saved_video} saved"
     print(json.dumps(out, indent=1))
 
@@ -1224,7 +1263,16 @@ def main():
     if not args:
         sys.exit(USAGE)
     cmd, rest = args[0], args[1:]
-    if cmd == "replay":
+    if IS_WINDOWS and cmd not in {"doctor", "extract-templates", "replay", "add-overlay", "add-text", "graphics", "transform", "remove", "keyframe", "clear-keyframes", "ls", "state", "launch", "quit"}:
+        from windows_backend import unsupported
+        unsupported()
+    if IS_WINDOWS and cmd == "doctor":
+        from windows_backend import doctor
+        doctor()
+    elif IS_WINDOWS and cmd == "extract-templates":
+        from windows_backend import extract_templates
+        extract_templates(rest[0], TEMPLATES)
+    elif cmd == "replay":
         cmd_replay(rest[0], opt(rest, "--name"))
     elif cmd == "add-overlay":
         add_overlay(rest[0], rest[1], opt(rest, "--at", float, 0.0),
@@ -1297,7 +1345,7 @@ def main():
     elif cmd == "state":
         cmd_state(opt(rest, "--draft"))
     elif cmd == "ls":
-        root = json.loads((DRAFT_ROOT / "root_meta_info.json").read_text())
+        root = json.loads((DRAFT_ROOT / "root_meta_info.json").read_text(encoding="utf-8-sig"))
         for d in root["all_draft_store"]:
             print(f"{d['draft_name']}: {d['tm_duration'] / 1e6:.2f}s  {d['draft_fold_path']}")
     elif cmd == "launch":

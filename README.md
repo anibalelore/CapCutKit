@@ -1,5 +1,38 @@
 # CapCut Bridge Kit
 
+## Adaptación local para Windows
+
+Esta copia incluye soporte para proyectos JSON de CapCut en Windows. Ejecuta
+`uv run capcut-bridge.py doctor` para comprobar la configuración, `ls` para
+listar proyectos y `state --draft 1009` para leer una línea de tiempo guardada.
+También puedes usar `./capcut.ps1 <comando> ...` desde PowerShell.
+
+- Detecta `%LOCALAPPDATA%/CapCut/User Data/Projects/com.lveditor.draft` y usa
+  `draft_content.json`. Puedes ajustar `CAPCUT_DRAFT_ROOT` y `CAPCUT_EXE`.
+- Soporta transformaciones, superposiciones, eliminación y fotogramas clave
+  mediante archivos. Antes de editar solicita el cierre normal de CapCut y
+  guarda metadatos y cachés en `.bridge-backups`. No fuerza el cierre.
+- `replay` escribe proyectos nuevos y es experimental en Windows: verifica
+  el resultado en CapCut antes de continuar trabajando. No reconstruyas un
+  proyecto con ediciones manuales. Usa una carpeta de trabajo absoluta como
+  argumento para mantener los archivos de entrada fuera del repositorio.
+- Instala FFmpeg y FFprobe o coloca sus ejecutables en `tools/bin`, sin cambiar
+  el PATH global. Los binarios no están incluidos en este repositorio.
+- `extract-templates <proyecto>` obtiene las plantillas de texto cuando existe
+  un segmento de texto con referencias de animación. `add-text` requiere
+  primero esas plantillas.
+- Los comandos de interfaz de macOS (`open`, `seek`, `export`, `click`, etc.)
+  no se portaron: los identificadores de accesibilidad no existen en esta
+  versión de Windows. Codex puede operar la ventana con Computer Use y
+  capturas de pantalla. `state` en Windows informa solo datos guardados.
+
+Verificación: `uv run --with psutil python -m unittest test_windows.py -v`.
+Las pruebas se ejecutan en carpetas temporales sin editar proyectos del usuario.
+Los formatos internos de CapCut no son una API estable; esta adaptación se
+probó leyendo los proyectos de CapCut 9.3.0 y editando copias aisladas.
+
+Las instrucciones siguientes describen el kit original para macOS.
+
 CapCut has no API. This kit drives it two other ways: editing its draft files
 directly on disk, and clicking its real UI through the macOS accessibility
 tree. macOS only, needs the CapCut desktop app and `uv` (`brew install uv`).
